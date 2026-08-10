@@ -757,6 +757,85 @@ class TestTritonHeuristics(TestCase):
                         self.assertNotEqual(configs, fallback, msg=arch)
 
     @skipUnless(HAS_GPU_AND_TRITON, "requires gpu and triton")
+    def test_rocm_prune_block_k_underfills_mfma(self):
+        # A config that declares kpack > 1 but whose block_k is smaller than
+        # kpack * kdim underfills the packed MFMA operand and is miscompiled,
+        # so it must be pruned.
+        if not torch.version.hip:
+            self.skipTest("ROCm-specific MFMA config pruning")
+        from torch._inductor.heuristics.template.triton import (
+            GemmConfig,
+            ROCmConfigHeuristic,
+            ROCmGemmConfig,
+        )
+
+        def count(mm_configs, dsize):
+            h = ROCmConfigHeuristic()
+            h.should_scale_configs = False
+            h.mm_configs = mm_configs
+            return len(
+                list(h.get_mm_configs()(1, 256, 128, dtype_size=dsize, op_name="mm"))
+            )
+
+        underfilled = ROCmGemmConfig(
+            16, 64, 16, 2, 4, group_m=8, matrix_instr_nonkdim=16, kpack=2
+        )
+        valid = ROCmGemmConfig(
+            16, 64, 32, 2, 4, group_m=8, matrix_instr_nonkdim=16, kpack=2
+        )
+        # f16 (dtype_size=2, kdim=16): block_k=16 < kpack(2) * 16 -> pruned;
+        # block_k=32 -> kept.
+        self.assertEqual(count([underfilled], 2), 0)
+        self.assertEqual(count([valid], 2), 1)
+
+        # Unknown dtype kdim: fp64 (dtype_size=8) is not in the CDNA MFMA table,
+        # so mfma_kdim returns None. Policy is to skip the underfill prune rather
+        # than guess, so the same config is kept instead of over-pruned.
+        self.assertEqual(count([underfilled], 8), 1)
+
+        # Plain GemmConfig lists (int8 / scaled_mm) never declare kpack. They
+        # inherit the arch default, which is clamped down to 1 when block_k cannot
+        # fill kpack * kdim, so a valid config is emitted instead of being pruned.
+        int8_configs = [GemmConfig(64, 64, 32, 2, 4), GemmConfig(128, 128, 32, 2, 8)]
+        self.assertEqual(count(int8_configs, 1), len(int8_configs))
+
+    @skipUnless(HAS_GPU_AND_TRITON, "requires gpu and triton")
+    def test_rocm_flex_default_kpack(self):
+        # Flex configs set matrix_instr_nonkdim=0 (no underfill hazard); kpack is
+        # a perf knob defaulted to 2 on archs that honor it (gfx908/gfx90a/gfx942).
+        if not torch.version.hip:
+            self.skipTest("ROCm-specific flex kpack default")
+        from torch._inductor.heuristics.template.triton import ROCmConfigHeuristic
+        from torch._inductor.utils import get_default_kpack, kpack_supported
+
+        expected = get_default_kpack()
+        self.assertEqual(expected, 2 if kpack_supported() else 1)
+
+        h = ROCmConfigHeuristic()
+        flex_configs = h.flex_attn_fwd_autotune_configs + h.flex_decode_autotune_configs
+        for cfg in flex_configs:
+            self.assertEqual(cfg.kpack, expected)
+
+    def test_mfma_kdim_cdna1_arch_dispatch(self):
+        # gfx908 (CDNA1): fully mocked so it runs without ROCm hardware.
+        # dtype_size=2 (f16/bf16) maps to the conservative f16 K-extent; fp64
+        # (dtype_size=8) is not in the table -> None.
+        from torch._inductor import utils
+
+        props = MagicMock()
+        props.gcnArchName = "gfx908"
+        with (
+            patch.object(torch.version, "hip", "6.0.0"),
+            patch.object(torch.cuda, "get_device_properties", return_value=props),
+        ):
+            self.assertTrue(utils.kpack_supported())
+            self.assertEqual(utils.mfma_kdim(4, 16), 4)  # f32
+            self.assertEqual(utils.mfma_kdim(2, 16), 16)  # f16/bf16 (conservative)
+            self.assertEqual(utils.mfma_kdim(1, 16), 16)  # int8/fp8
+            self.assertEqual(utils.mfma_kdim(2, 32), 8)  # f16/bf16 (conservative)
+            self.assertIsNone(utils.mfma_kdim(8, 16))  # fp64 unknown
+
+    @skipUnless(HAS_GPU_AND_TRITON, "requires gpu and triton")
     def test_compile_time_autotune_not_repeated_at_runtime(self):
         def fn(x):
             return (x + 1).sum(dim=1)
