@@ -4339,7 +4339,6 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         # Different value -> different hash
         self.assertNotEqual(data_a, data_c)
 
-
     def test_with_effects_other_effectful_op_bypassed(self):
         graph = torch.fx.Graph()
         token = graph.placeholder("token")
